@@ -1,0 +1,131 @@
+name: Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      source_path:
+        description: Uploaded ZIP or HTML path
+        required: true
+        type: string
+      app_name:
+        description: App display name
+        required: true
+        type: string
+      package_id:
+        description: Android package ID
+        required: true
+        type: string
+      orientation:
+        description: Screen orientation
+        required: true
+        type: choice
+        options: [portrait, landscape, unspecified]
+      status_bar_color:
+        description: Status bar hex color
+        required: true
+        type: string
+        default: '#101827'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate and prepare website
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_ID: ${{ inputs.package_id }}
+          ORIENTATION: ${{ inputs.orientation }}
+          STATUS_COLOR: ${{ inputs.status_bar_color }}
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,zipfile,shutil,re,xml.sax.saxutils
+          src=pathlib.Path(os.environ['SOURCE_PATH']).resolve()
+          root=pathlib.Path.cwd().resolve()
+          if not src.is_relative_to(root) or not src.is_file(): raise SystemExit('Invalid source path')
+          pkg=os.environ['PACKAGE_ID']
+          if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+',pkg): raise SystemExit('Invalid package ID')
+          color=os.environ['STATUS_COLOR']
+          if not re.fullmatch(r'#[0-9a-fA-F]{6}',color): raise SystemExit('Invalid status bar color')
+          out=pathlib.Path('app/src/main/assets/site'); out.mkdir(parents=True,exist_ok=True)
+          if src.suffix.lower() in ('.html','.htm'):
+              shutil.copy2(src,out/'index.html')
+          elif src.suffix.lower()=='.zip':
+              with zipfile.ZipFile(src) as z:
+                  for n in z.namelist():
+                      p=pathlib.PurePosixPath(n)
+                      if p.is_absolute() or '..' in p.parts: raise SystemExit('Unsafe ZIP path')
+                  z.extractall(out)
+              if not (out/'index.html').exists():
+                  candidates=list(out.rglob('index.html'))
+                  if not candidates: raise SystemExit('ZIP must contain index.html')
+                  folder=candidates[0].parent
+                  temp=out.parent/'site-temp'
+                  shutil.copytree(folder,temp,dirs_exist_ok=True)
+                  shutil.rmtree(out); temp.rename(out)
+          else: raise SystemExit('Only ZIP or HTML accepted')
+          if not (out/'index.html').exists(): raise SystemExit('Missing index.html')
+          java=pathlib.Path('app/src/main/java')/pathlib.Path(pkg.replace('.','/'))
+          java.mkdir(parents=True,exist_ok=True)
+          (pathlib.Path('app/src/main/AndroidManifest.xml')).write_text(f'''<manifest xmlns:android="http://schemas.android.com/apk/res/android"><uses-permission android:name="android.permission.INTERNET"/><application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:label="{xml.sax.saxutils.escape(os.environ['APP_NAME'])}" android:usesCleartextTraffic="true"><activity android:name=".MainActivity" android:exported="true" android:screenOrientation="{os.environ['ORIENTATION']}"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity></application></manifest>''')
+          (java/'MainActivity.java').write_text(f'''package {pkg};
+          import android.app.Activity; import android.os.Bundle; import android.webkit.WebView; import android.webkit.WebViewClient; import android.webkit.WebChromeClient; import android.graphics.Color;
+          public class MainActivity extends Activity {{
+          WebView web;
+          @Override public void onCreate(Bundle b) {{ super.onCreate(b); getWindow().setStatusBarColor(Color.parseColor("{color}")); web=new WebView(this); web.getSettings().setJavaScriptEnabled(true); web.getSettings().setDomStorageEnabled(true); web.setWebViewClient(new WebViewClient()); web.setWebChromeClient(new WebChromeClient()); setContentView(web); web.loadUrl("file:///android_asset/site/index.html"); }}
+          @Override public void onBackPressed() {{ if(web!=null && web.canGoBack()) web.goBack(); else super.onBackPressed(); }}
+          }}''')
+          PY
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'Web2APK'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace System.getenv('PACKAGE_ID')
+            compileSdk 35
+            defaultConfig {
+              applicationId System.getenv('PACKAGE_ID')
+              minSdk 23
+              targetSdk 28
+              versionCode 1
+              versionName '1.0'
+            }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        env:
+          PACKAGE_ID: ${{ inputs.package_id }}
+        run: gradle --no-daemon assembleDebug
+      - name: Publish APK release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "web2apk-${{ github.run_id }}" app/build/outputs/apk/debug/app-debug.apk --title "Web2APK build ${{ github.run_number }}" --notes "Generated Android debug APK."
+      - name: Delete uploaded source file
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          SHA=$(gh api "repos/${{ github.repository }}/contents/$SOURCE_PATH?ref=main" --jq .sha 2>/dev/null || true)
+          if [ -n "$SHA" ]; then
+            gh api --method DELETE "repos/${{ github.repository }}/contents/$SOURCE_PATH" -f message="Remove temporary Web2APK upload" -f sha="$SHA" -f branch=main || true
+          fi
